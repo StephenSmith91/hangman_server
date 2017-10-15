@@ -1,4 +1,6 @@
 /* Header files */
+#define _GNU_SOURCE
+
 #include <stdio.h> 
 #include <stdlib.h>
 #include <stdbool.h>
@@ -13,44 +15,98 @@
 #include <sys/wait.h> 
 #include <arpa/inet.h>
 #include <signal.h>
+#include <pthread.h>     /* pthread functions and data structures     */
+#include <semaphore.h>	/* semaphore functions for Leaderboard section*/
+
 
 /* Defines */
 #define PORT 12345    /* the default port client will be connecting to */
 #define MAXDATASIZE 100 /* max number of bytes we can get at once */
 #define BACKLOG 10     /* how many pending connections queue will hold */
-#define CHAR_SIZE 20	/* Max Char size for password and username */
-#define NUMBER_OF_STRINGS 11 /* Number of usernames and passwords */
+#define CHAR_SIZE 22	/* Max Char size for password and username */
+#define NUMBER_CLIENTS 11 /* Number of usernames and passwords */
 #define NUMBER_OF_WORDS 288 /* Number of words in hangman_txt */
 #define NUMBER_OF_LETTERS 22
 #define PLAY_GAME 1
 #define LEADERBOARD 2
 #define QUIT 3
 
+#define NUM_HANDLER_THREADS 10/* number of threads used to service requests */
+
+
+void EventLoop(int new_fd);
+
 
 /* Global Varaibles */
 bool keeprunning = true; // this flag gets set to false when ctl+c is pressed
+int served_clients = -1;
+int sockfd;
+pthread_t pthr_id[NUM_HANDLER_THREADS];      /* thread IDs            */
+pthread_t parent_thread_id;
+
+/* global mutex for our program. assignment initializes it. */
+/* note that we use a RECURSIVE mutex, since a handler      */
+/* thread might try to lock it twice consecutively.         */
+pthread_mutex_t request_mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+
+/* global condition variable for our program. assignment initializes it. */
+pthread_cond_t  got_request   = PTHREAD_COND_INITIALIZER;
+
+int num_requests = 0;   /* number of pending requests, initially none */
+
+/* global sempahore mutex, assignment initialsies it */
+sem_t rw;
+
+/* global reader mutex */
+pthread_mutex_t reader = PTHREAD_MUTEX_INITIALIZER;
+
+int read_count = 0;
+
+
 
 /* Structs */
+
+/* Authentication struct - stores passwords and usernames */
+//typedef struct Leaderboard;
+typedef struct ThreadState threadState_t;// info of a threads client - deallocate if don't have a client
+
 struct authentication{
-	char usernames[NUMBER_OF_STRINGS][CHAR_SIZE+1];
-	char passwords[NUMBER_OF_STRINGS][CHAR_SIZE+1];
+	char usernames[NUMBER_CLIENTS][CHAR_SIZE+1];
+	char passwords[NUMBER_CLIENTS][CHAR_SIZE+1];
 }authentication;
 
+/* Word struct - stores all the words for hangman */
 struct Words{
 	char object[NUMBER_OF_WORDS][NUMBER_OF_LETTERS];
 	char objectType[NUMBER_OF_WORDS][NUMBER_OF_LETTERS];
 }words;
 
-struct ClientStates{
-	int online [NUMBER_OF_STRINGS];
-	int gamesPlayed [NUMBER_OF_STRINGS];
-	int gamesWon [NUMBER_OF_STRINGS];
-	int current_player; // for sinlge thread keeps track of current player
-}clientStates;
+/* Thread state - information about the threads current client if it has one */
+struct ThreadState{
+	int socket_id;
+	int current_player; // index to the clients place in the leader board
+ }ThreadState;
+
+/* format of a single request. */
+struct request {
+    int number;             /* number of the request                  */
+    int socket_id;
+    struct request* next;   /* pointer to next request, NULL if none. */
+};
+
+struct request* requests = NULL;     /* head of linked list of requests. */
+struct request* last_request = NULL; /* pointer to last request.         */
+
+/*Leaderboard struct - stores Leaderboard information */
+struct Leaderboard{
+	char clientNames[NUMBER_CLIENTS][CHAR_SIZE+1];
+	int gamesWon[NUMBER_CLIENTS];
+	int gamesPlayed[NUMBER_CLIENTS];
+}Leaderboard;
 
 
 /* Function Prototypes */
-void Instantiate_ClientStates();
+void Instantiate_LeaderBoard();
 
 void LoadFiles();
 void LoadCredentils();
@@ -61,7 +117,7 @@ void CheckForNewClient(int* sockfd, int* new_fd,\
 	struct sockaddr_in *my_addr, struct sockaddr_in *their_addr, socklen_t* sin_size);
 void Listen_Accept(int *sockfd, int *new_fd,\
 	struct sockaddr_in *my_addr, struct sockaddr_in *their_addr, socklen_t* sin_size);
-void AuthenticateClients(int* sockfd, int* new_fd);
+threadState_t*  AuthenticateClients(int* new_fd);
 
 void GetClientChoice(int* choice, int new_fd);
 bool CheckCorrectInput(int choice, int new_fd);
@@ -72,22 +128,181 @@ int SelectRandomNumber();
 char* concat(const char *s1, const char *s2);
 void signalhandler(int);
 
-void ShowLeaderBoard(int new_fd, int games_played, int games_won);
+void p(int new_fd, int games_played, int games_won);
 bool PlayGame(int new_fd);
 
 /* Funciton Implementations */
 
 
-/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Instantiate_ClientStates ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/*
+ * function add_request(): add a request to the requests list
+ * algorithm: creates a request structure, adds to the list, and
+ *            increases number of pending requests by one.
+ * input:     request number, linked list mutex.
+ * output:    none.
+ */
+void add_request(int request_num, int socket, pthread_mutex_t* p_mutex, pthread_cond_t*  p_cond_var)
+{
+    int rc;                         /* return code of pthreads functions.  */
+    struct request* a_request;      /* pointer to newly added request.     */
+
+    /* create structure with new request */
+    a_request = (struct request*)malloc(sizeof(struct request));
+    if (!a_request) { /* malloc failed?? */
+        fprintf(stderr, "add_request: out of memory\n");
+        exit(1);
+    }
+    a_request->number = request_num;
+    a_request->socket_id = socket;
+    a_request->next = NULL;
+
+    /* lock the mutex, to assure exclusive access to the list */
+    rc = pthread_mutex_lock(p_mutex);
+
+    /* add new request to the end of the list, updating list */
+    /* pointers as required */
+    if (num_requests == 0) { /* special case - list is empty */
+        requests = a_request;
+        last_request = a_request;
+    }
+    else {
+        last_request->next = a_request;
+        last_request = a_request;
+    }
+
+    /* increase total number of pending requests by one. */
+    num_requests++;
+
+    /* unlock mutex */
+    rc = pthread_mutex_unlock(p_mutex);
+
+    /* signal the condition variable - there's a new request to handle */
+    rc = pthread_cond_signal(p_cond_var);
+}
+
+
+
+/*
+ * function get_request(): gets the first pending request from the requests list
+ *                         removing it from the list.
+ * algorithm: creates a request structure, adds to the list, and
+ *            increases number of pending requests by one.
+ * input:     request number, linked list mutex.
+ * output:    pointer to the removed request, or NULL if none.
+ * memory:    the returned request need to be freed by the caller.
+ */
+struct request* get_request(pthread_mutex_t* p_mutex)
+{
+    int rc;                         /* return code of pthreads functions.  */
+    struct request* a_request;      /* pointer to request.                 */
+
+    /* lock the mutex, to assure exclusive access to the list */
+    rc = pthread_mutex_lock(p_mutex);
+
+    if (num_requests > 0) {
+        a_request = requests;
+        requests = a_request->next;
+        if (requests == NULL) { /* this was the last request on the list */
+            last_request = NULL;
+        }
+        /* decrease the total number of pending requests */
+        num_requests--;
+    }
+    else { /* requests list is empty */
+        a_request = NULL;
+    }
+
+    /* unlock mutex */
+    rc = pthread_mutex_unlock(p_mutex);
+
+    /* return the request to the caller. */
+    return a_request;
+}
+
+/*
+ * function handle_request(): handle a single given request.
+ * algorithm: prints a message stating that the given thread handled
+ *            the given request.
+ * input:     request pointer, id of calling thread.
+ * output:    none.
+ */
+void handle_request(struct request* a_request, int thread_id)
+{
+    if (a_request) {
+        printf("Thread '%d' handled request '%d'\n",
+               thread_id, a_request->number);
+        fflush(stdout);
+        EventLoop(a_request->socket_id);
+    }
+}
+
+/*
+ * function handle_requests_loop(): infinite loop of requests handling
+ * algorithm: forever, if there are requests to handle, take the first
+ *            and handle it. Then wait on the given condition variable,
+ *            and when it is signaled, re-do the loop.
+ *            increases number of pending requests by one.
+ * input:     id of thread, for printing purposes.
+ * output:    none.
+ */
+void* handle_requests_loop(void* data)
+{
+    int rc;                         /* return code of pthreads functions.  */
+    struct request* a_request;      /* pointer to a request.               */
+    int thread_id = *((int*)data);  /* thread identifying number           */
+
+
+    /* lock the mutex, to access the requests list exclusively. */
+    rc = pthread_mutex_lock(&request_mutex);
+
+    /* do forever.... */
+    while (1) {
+
+        if (num_requests > 0) { /* a request is pending */
+            a_request = get_request(&request_mutex);
+            if (a_request) { /* got a request - handle it and free it */
+                /* unlock mutex - so other threads would be able to handle */
+                /* other reqeusts waiting in the queue paralelly.          */
+                rc = pthread_mutex_unlock(&request_mutex);
+                handle_request(a_request, thread_id);
+                free(a_request);
+                /* and lock the mutex again. */
+                rc = pthread_mutex_lock(&request_mutex);
+            }
+        }
+        else {
+            /* wait for a request to arrive. note the mutex will be */
+            /* unlocked here, thus allowing other threads access to */
+            /* requests list.                                       */
+
+            rc = pthread_cond_wait(&got_request, &request_mutex);
+            /* and after we return from pthread_cond_wait, the mutex  */
+            /* is locked again, so we don't need to lock it ourselves */
+
+        }
+    }
+}
+
+
+
+
+/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Instantiate_ThreadState ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Instantiate struct members of cleintStates to 0
 */
-void Instantiate_ClientStates(){
+void Instantiate_LeaderBoard(){
+	int jj =0;
 	/* Instantiate struct members to zero initially */
-	for(int ii = 0; ii < NUMBER_OF_STRINGS; ii++){
-		clientStates.online[ii] = 0;
-		clientStates.gamesPlayed[ii] = 0;
-		clientStates.gamesWon[ii] = 0;
-	}	
+	for(int ii = 0; ii < NUMBER_CLIENTS; ii++){
+		Leaderboard.gamesPlayed[ii] = 0;
+		Leaderboard.gamesWon[ii] = 0;
+	}
+// 		for(jj = 0; jj < sizeof(Leaderboard.clientNames[0])/sizeof(char); jj++){
+// 			Leaderboard.clientNames[ii][jj] = ' ';
+// 			if(jj == sizeof(Leaderboard.clientNames[0])/sizeof(char) - 1){
+// 				Leaderboard.clientNames[ii][jj] = '\0';
+// 			}	
+// 		}			
+// }
 }
 
 
@@ -95,8 +310,9 @@ void Instantiate_ClientStates(){
 Interface for loading textfiles functions
 */
 void LoadFiles(){
+	Instantiate_LeaderBoard();
 	LoadCredentils();
-	LoadWords();
+	LoadWords();	
 }
 
 
@@ -110,6 +326,9 @@ void LoadCredentils(){
 	char* filename = "Authentication.txt"; /* filename, if in diff loc use: "C:\\temp\\test.txt"*/
 	char buffer[20];					   /* buffer to hold usernames and passwords */
 	int i = 0;
+	char* chuckaway1 = (char*)malloc(20*sizeof(char));
+	char* chuckaway2 = (char*)malloc(20*sizeof(char));
+	int our_number;
 
 	/* TODO: Allocate memory using Malloc instead */
 
@@ -130,10 +349,25 @@ void LoadCredentils(){
 	The 1st element of of the list is just "Passwords and Usernames," so can be disregarded 
 	*/
 	while(fgets(buffer, CHAR_SIZE, fp) != NULL){
-		sscanf(buffer, "%s %s", authentication.usernames[i], authentication.passwords[i]);
+
+		if(i>0){ /* 1st Line of text is unecessary */
+
+			sscanf(buffer, "%s %s", authentication.usernames[i-1], authentication.passwords[i-1]);//authentication.passwords[i-1]
+
+
+			strcpy(Leaderboard.clientNames[i-1], authentication.usernames[i-1]);
+
+		}else{
+			sscanf(buffer, "%s,%s", chuckaway1, chuckaway2);
+		}		
 		i++;
+
+
 	}
 	fclose(fp);
+
+	free(chuckaway1);
+	free(chuckaway2);
 }
 
 
@@ -207,9 +441,7 @@ Inputs:
 void CheckForNewClient(int* sockfd, int* new_fd,\
 	struct sockaddr_in *my_addr, struct sockaddr_in *their_addr, socklen_t* sin_size){
 
-	Listen_Accept(sockfd, new_fd, my_addr, their_addr, sin_size);
 
-	AuthenticateClients(sockfd, new_fd);
 }
 
 
@@ -222,26 +454,26 @@ Inputs:
 
 Outputs:
 		Nothing
-*/
-void Listen_Accept(int* sockfd, int* new_fd,\
-	struct sockaddr_in *my_addr, struct sockaddr_in *their_addr, socklen_t* sin_size){
+// /**/
+// void Listen_Accept(int* sockfd, int* new_fd,\
+// 	struct sockaddr_in *my_addr, struct sockaddr_in *their_addr, socklen_t* sin_size){
 
-		/* start listnening */
-	if (listen(*sockfd, BACKLOG) == -1) {
-		perror("listen");
-		exit(1);
-	}
+// 		/* start listnening */
+// 	if (listen(*sockfd, BACKLOG) == -1) {
+// 		perror("listen");
+// 		exit(1);
+// 	}
 
-	printf("server starts listnening ...\n");
+// 	printf("server starts listnening ...\n");
 
-	if ((*new_fd = accept(*sockfd, (struct sockaddr *)their_addr, sin_size)) == -1) {
-		perror("accept");
+// 	if ((*new_fd = accept(*sockfd, (struct sockaddr *)their_addr, sin_size)) == -1) {
+// 		perror("accept");
 		
-	}
-//printf("New fd  = %d\n", *new_fd);
-//printf("server: got connection from %s\n", inet_ntoa((*my_addr).sin_addr));
+// 	}
+// //printf("New fd  = %d\n", *new_fd);
+// //printf("server: got connection from %s\n", inet_ntoa((*my_addr).sin_addr));
 
-}
+// }*/
 
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ AuthenticateClients~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -257,11 +489,12 @@ Inputs:
 Outputs:
 		Nothing, but program won't continue if don't get the correct credentials
 */
-void AuthenticateClients(int* sockfd, int* new_fd){
+threadState_t*  AuthenticateClients(int* new_fd){
 	bool authentic = false;
 	char username[9];
 	char password[9];
 	int numbytes;
+	threadState_t* thread_state_ptr;
 
 	/* Recieve username and password from client */
 	if ((numbytes=recv(*new_fd, &username, 9*sizeof(char), 0)) == -1) {
@@ -274,18 +507,23 @@ void AuthenticateClients(int* sockfd, int* new_fd){
 		exit(1);
 	}
 
+	printf("Authenticate: Client sent:%s\n", username);
+
+
 	/* Check if Client is authentic */
-	for(int ii = 1; ii < NUMBER_OF_STRINGS; ii++){
+	for(int ii = 0; ii < NUMBER_CLIENTS; ii++){
 		if((strcmp(username, authentication.usernames[ii]) == 0)  && \
 			(strcmp(password, authentication.passwords[ii]) == 0)){
 			authentic = true;
 
-			clientStates.online[ii] = 1;//would like to bind client pid to this address aswell
-			clientStates.current_player = ii;
+			thread_state_ptr = (threadState_t*)malloc(sizeof(ThreadState));
+
+			(*thread_state_ptr).current_player = ii;
 
 			break;
 		}
 	}
+	printf("Authenticate: Severfile:%s\n", authentication.usernames[(*thread_state_ptr).current_player]);
 
 	/* Send client the result */
 	if(authentic){
@@ -294,9 +532,8 @@ void AuthenticateClients(int* sockfd, int* new_fd){
 		send(*new_fd, "N", 5*sizeof(char), 0);
 		close(*new_fd);
 		printf("disconnected\n"); /* need would like to send a msg client specific */
-		close(*sockfd);
-		exit(1);
 	} 
+	return thread_state_ptr;
 }
 
 
@@ -385,11 +622,28 @@ int SelectRandomNumber(){
 
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ concat ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Puts to strings together, and puts a null terminating charcater at the end, eg '/0'
 */
 char* concat(const char *s1, const char *s2){
+	int jj = 0;
 	char *result = malloc(strlen(s1) + strlen(s2) +1);
-	strcpy(result, s1);
-	strcat(result, s2);
+	// strcpy(result, s1);
+	// strcat(result, s2);
+	
+
+
+	//char result [strlen(s2)+strlen(s1)+1];
+
+	for(int ii = 0; ii < strlen(s1)+strlen(s2); ii++){
+		if(ii < strlen(s1)){
+			result[ii] = s1[ii];
+		}else{
+			result[ii] = s2[jj];
+			jj++;
+		}
+		
+	}
+	result[strlen(s1)+strlen(s2)+1] = '\0';
 	return result;
 }
 
@@ -430,11 +684,12 @@ int CalcGuessLeft(int wordLength){
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ShowLeaderBoard ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 */
-void ShowLeaderBoard(int new_fd, int games_won, int games_played){
+void ShowLeaderBoard(int new_fd, int games_played, struct ThreadState *thread_state_ptr){
 	int toSend, answer = 0, result = 0;
 	uint16_t network_byte_order_short;
+	// char Name[11];
 
-	if(games_played <= 0){
+	if(games_played <= 0){ //need to have local version so don't read leaderboard
 
 		/* Send 0 to say no info at this time */
 		network_byte_order_short = htons(answer);
@@ -443,6 +698,18 @@ void ShowLeaderBoard(int new_fd, int games_won, int games_played){
 		printf("Im at LeaderBoard - no games_played\n");
 		return;
 	}
+
+	/*Critical Readers section */
+	pthread_mutex_lock(&reader);
+
+	read_count++;
+	if(read_count == 1){
+		sem_wait(&rw); // 1st reader blocks until something in leader board 
+	}
+	pthread_mutex_unlock(&reader);
+
+	/* Read Now */
+
 	/* {1. Make/Get List of all current players
 	   2. For each player put thier statistics (calc as well) in a struct/array} do before this funct
 	   		should only need to update this table (set list) & then put each col in a new sorted list
@@ -460,39 +727,95 @@ void ShowLeaderBoard(int new_fd, int games_won, int games_played){
 	   9. Repeat Steps 4-6 for each player
 	*/
 	printf("Im at LeaderBoard - games_played is = %d\n", games_played);
+	printf("\nClient Name: %s\n", authentication.usernames[(*thread_state_ptr).current_player]);
 
 
-	/* Send winning confirmation */
+	//1. Go through leaderboard struct and keep indexes of players who have played a game
+		int player_index[NUMBER_CLIENTS]; int players_played = 0; int a;int t;
+
+		for(int ll = 0; ll < NUMBER_CLIENTS; ll++){
+			if (Leaderboard.gamesPlayed[ll] > 0){
+				player_index[players_played] = ll;
+				players_played++;
+				printf("Player indexes who have played: %d\n", ll);
+			}
+		}
+		printf("Players who have played: %d\n", players_played);
+
+	//order the player_index array so that it reflects game rules.
+	for (int k = 0; k < players_played-1; k++){
+		printf("k=%d\n", k);
+		for(t = k+1; t < players_played; t++){
+			printf("t=%d\n", t);
+			if(Leaderboard.gamesWon[player_index[k]] > Leaderboard.gamesWon[player_index[t]]){
+				a = player_index[k];
+				player_index[k] = player_index[t];
+				player_index[t] = a;
+			}else if(Leaderboard.gamesWon[player_index[k]] == Leaderboard.gamesWon[player_index[t]]){
+				if(Leaderboard.gamesPlayed[player_index[k]] > Leaderboard.gamesPlayed[player_index[t]]){
+					a = player_index[k];
+					player_index[k] = player_index[t];
+					player_index[t] = a;
+
+				}else if(Leaderboard.gamesPlayed[player_index[k]] == Leaderboard.gamesPlayed[player_index[t]]){
+					if(Leaderboard.clientNames[player_index[k]][0] > Leaderboard.clientNames[player_index[t]][0]){
+					a = player_index[k];
+					player_index[k] = player_index[t];
+					player_index[t] = a;
+
+					}
+				}
+			}
+
+		}
+	}
+
+		/* Send winning confirmation */
 	answer = 1;
 	network_byte_order_short = htons(answer);
 	send(new_fd, &network_byte_order_short, sizeof(uint16_t), 0);
 
-	/* Synching */
-	RecvNumberFrom_Client(new_fd, &result);
+		/* Synching */
+	//RecvNumberFrom_Client(new_fd, &result);
 	/* Synching finished */
 
-	/* Send how many players */
-	toSend = 1;
+	/* Send how many players */ //STILL TODO for multithread
+	toSend = players_played;
 	network_byte_order_short = htons(toSend);
 	send(new_fd, &network_byte_order_short, sizeof(uint16_t), 0);
 
 
+
+
+	for(int k = 0; k < players_played; k++){
+		printf("Order of players %s\n", Leaderboard.clientNames[player_index[k]]);
+
+
 	/*Send to Client thier name */
-	char * Name = authentication.usernames[clientStates.current_player];
-	send(new_fd, Name, 11*sizeof(char), 0);
+	//memset(Name, '\0', sizeof(Name));
+	//strcpy(Name, Leaderboard.clientNames[(*thread_state_ptr).current_player]);
+	send(new_fd, Leaderboard.clientNames[player_index[k]], 11*sizeof(char), 0); 
+	//printf("\nClient Name: %s\n", Leaderboard.clientNames[(*thread_state_ptr).current_player]);
 
 	/* Send to client thier number of games won */
-	toSend = games_won;
+	toSend = Leaderboard.gamesWon[player_index[k]];
 	network_byte_order_short = htons(toSend);
 	send(new_fd, &network_byte_order_short, sizeof(uint16_t), 0);
 
 	/*Send to client their number of games played */
-	toSend = games_played;
+	toSend = Leaderboard.gamesPlayed[player_index[k]] ;
 	network_byte_order_short = htons(toSend);
 	send(new_fd, &network_byte_order_short, sizeof(uint16_t), 0);
-	return;
+}
 
-	printf("LeaderBoard: Sent games_played = %d\n", toSend);
+	/* end readers section */
+	pthread_mutex_lock(&reader);
+	read_count--;
+	if(read_count == 0){
+		sem_post(&rw);
+	}
+	pthread_mutex_unlock(&reader);
+
 }
 
 
@@ -652,33 +975,91 @@ bool PlayGame(int new_fd){
 
 		i++;
 	} // end while
+	if(keeprunning){
 
 	//TODOd - free already guessed
 		//send client guess
-	if (send(new_fd, alreadyGuessed, 30*sizeof(char), 0) == -1){
-		perror("send: ");
-		exit(1);
-	}
+		if (send(new_fd, alreadyGuessed, 30*sizeof(char), 0) == -1){
+			perror("send: ");
+			exit(1);
+		}
 		// send number of guess left
-	toSend = guess_left;
-	network_byte_order_short = htons(toSend);
-	if (send(new_fd, &network_byte_order_short, sizeof(uint16_t), 0) == -1){
-		perror("send: ");
-		exit(1);
-	}
+		toSend = guess_left;
+		network_byte_order_short = htons(toSend);
+		if (send(new_fd, &network_byte_order_short, sizeof(uint16_t), 0) == -1){
+			perror("send: ");
+			exit(1);
+		}
 		// Send word to client - start off with just number of space
-	if (send(new_fd, wordfromthe_Server, 30*sizeof(char), 0) == -1){
-		perror("send: ");
-		exit(1);
+		if (send(new_fd, wordfromthe_Server, 30*sizeof(char), 0) == -1){
+			perror("send: ");
+			exit(1);
+		}
 	}
 
 	// Deallocate memory
 	for(int jj = 0; jj < strlen(wordtocheck)+1; jj++){ // +1 to account for '\0'
 		free(wordtocheck);
-		wordtocheck++;
+	wordtocheck++;
+}
+
+return won;
+}
+
+
+/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ EventLoop ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+*/
+void EventLoop(int new_fd){
+	int choice = 0; 
+	int  keeprunning = 1; bool gameswon = false;
+	int games_played = 0;bool validInput = false;
+	threadState_t* thread_state_ptr;
+
+	if((thread_state_ptr = AuthenticateClients(&new_fd)) == NULL){
+		// deallocate memory and return;
+		return;
 	}
 
-	return won;
+	printf("Event Loop: Client Name : %s\n", authentication.usernames[ThreadState.current_player]);
+
+	while(keeprunning){
+		while(!validInput || choice == 0){
+			GetClientChoice(&choice, new_fd); /*Recieves Client choice */
+			validInput = CheckCorrectInput(choice, new_fd); /* Check response valid and send confirmation to Client */		
+		}
+		validInput = false;
+
+		if(choice == QUIT && keeprunning){ 
+			free(thread_state_ptr);
+			close(new_fd);//other threads won't be able to do this - will need to be handled by main - but might not need to  id have a playing struct variable
+			return; // 
+
+		}else if(choice == LEADERBOARD && keeprunning){
+			ShowLeaderBoard(new_fd, games_played, thread_state_ptr);
+
+		}else if(keeprunning){ /*PLAY_GAME */	
+			gameswon = PlayGame(new_fd);
+				games_played++; // this is a local variable
+
+				/* Critical section */
+				sem_wait(&rw);
+
+				Leaderboard.gamesPlayed[(*thread_state_ptr).current_player]++;
+				if(gameswon){
+					Leaderboard.gamesWon[(*thread_state_ptr).current_player]++;
+				}				
+				
+				printf("PlayGame (end) gameswon = %d, games_played = %d\n", Leaderboard.gamesWon[(*thread_state_ptr).current_player], games_played);
+
+				sem_post(&rw);
+			}		
+
+		} choice = 0; /* Reset choice */				
+	
+	if(!keeprunning){
+		free(thread_state_ptr);
+		pthread_exit(NULL); //exit thread
+	}
 }
 
 
@@ -688,56 +1069,75 @@ bool PlayGame(int new_fd){
 int main(int argc, char* argv[]){
 /* signal handling for ctl+c user input */
 	signal(SIGINT, signalhandler);
+	LoadFiles();
 
 	/* TODO: dynamically allocate memory to structs */
 
 	int games_won = 0; int games_played = 0;
 	bool validInput = false;
-	int sockfd, new_fd, portNumber, choice = 0;  /* listen on sock_fd, new connection on new_fd */
+	int  new_fd, portNumber, choice = 0;  /* listen on sock_fd, new connection on new_fd */
 	struct sockaddr_in my_addr;    /* my address information */
 	struct sockaddr_in their_addr; /* connector's address information */
 	socklen_t sin_size = sizeof(struct sockaddr_in);
 
+
+	int i = 0;                                /* loop counter          */
+    
+    pthread_t  p_threads[NUM_HANDLER_THREADS];   /* thread's structures   */
+    struct timespec delay;                       /* used for wasting time */
+	int thr_id[NUM_HANDLER_THREADS];      /* thread IDs            */
+    parent_thread_id = pthread_self();
+    int *client_list = malloc(sizeof(int));
+
+    /* semaphore intialisation: set vaule to 1 */
+    sem_init(&rw, 0, 1);
+
+
+
 	/* Preliminary funtions - Load files and Setup and accept new Clients */
-	LoadFiles();
+	
 	SetupSocket(argc,argv, &portNumber, &sockfd, &my_addr);		 
-	CheckForNewClient(&sockfd, &new_fd, &my_addr, &their_addr, &sin_size);
+	//CheckForNewClient(&sockfd, &new_fd, &my_addr, &their_addr, &sin_size);
 
-	printf("server: got connection from %s\n", \
-		inet_ntoa(their_addr.sin_addr));
-	 /*char disp[30]; sprintf(disp, "\n%d", portNumber);puts(disp);*/ //checking local funcitons are actually assignining :/
-
-	/* EVENT LOOP */
-	while(choice != 3  && keeprunning){
-		while(!validInput || choice == 0){
-			GetClientChoice(&choice, new_fd); /*Recieves Client choice */
-			validInput = CheckCorrectInput(choice, new_fd); /* Check response valid and send confirmation to Client */		
-		}
-		validInput = false;
-
-		if(choice == QUIT && keeprunning){
-			close(new_fd);
-			close(sockfd);
-			exit(1);
-
-		}else if(choice == LEADERBOARD && keeprunning){
-			ShowLeaderBoard(new_fd, games_won, games_played);
-
-		}else if(keeprunning){ /*PLAY_GAME */
-			games_played++;	
-			if(PlayGame(new_fd)){
-				games_won++;
-				printf("PlayGame (end) gameswon = %d, games_played = %d\n", games_won, games_played);
-			}		
-
-		} choice = 0; /* Reset choice */				
-	}
-	if(!keeprunning){
-		printf("EXIT signal: Closing Sockets\n");
-		close(new_fd);
-		close(sockfd);
-		printf("EXIT signal: Goodbye\n");
+	// Listen_Accept(*sockfd, *new_fd, *my_addr, *their_addr, *sin_size);
+			/* start listnening */
+	if (listen(sockfd, BACKLOG) == -1) {
+		perror("listen");
 		exit(1);
+	}
+	printf("server starts listnening ...\n");
+
+
+    /* create the request-handling threads */
+    for (i=0; i<NUM_HANDLER_THREADS; i++) {
+        thr_id[i] = i;
+        pthr_id[i] = pthread_create(&p_threads[i], NULL, handle_requests_loop, (void*)&thr_id[i]);
+        printf("Thread ID: %d\n", (int)thr_id[i]);
+    }
+
+    while(1){ // this is the parent thread (thread #1) loop - keep adding 'jobs' to the list to do
+
+
+		if ((new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size)) == -1) {
+			perror("accept");
+		}
+		i++;
+
+		client_list = (int*)realloc(client_list, sizeof(int) * i);
+		served_clients += 1;
+		client_list[served_clients] = new_fd; // store fd's and i, # fd's so can close the prgram with ctl+c
+
+		
+
+		add_request(served_clients, new_fd, &request_mutex, &got_request);
+		printf("______________Request number <%d> is added.\n", num_requests);
+
+		
+
+		printf("server: got connection from %s\n", \
+		inet_ntoa(their_addr.sin_addr));
+	 	/*char disp[30]; sprintf(disp, "\n%d", portNumber);puts(disp);*/ //checking local funcitons are actually assignining :/
+	
 	}
 
 	return 1;
@@ -751,7 +1151,29 @@ int main(int argc, char* argv[]){
 Catches ct+c by user and exits program gracefully
 */
 void signalhandler(int signum){
-	printf("\nEXIT signal: %d. Exiting as soon as possible\n", signum);
-	keeprunning = false;
-	//exit(1);
+	
+	keeprunning = false; // get thread to return to pthred_create
+
+	// if main thread - wait until other threads exit
+	if(pthread_self() == parent_thread_id){
+		printf("\nEXIT signal: %d. Exiting as soon as possible\n", signum);
+		printf("EXIT signal: Closing Sockets\n");
+
+		//close(new_fd);
+		close(sockfd);
+		printf("EXIT signal: Waiting for other threads to exit...\n");	
+
+		// wait for other threads to exit...
+		for(int ii = 0; ii < NUM_HANDLER_THREADS; ii++){ 
+			pthread_join(pthr_id[ii], NULL);
+		}
+	}else{ // non-parent threads quit straight away - or could just get them to quit when finished allocating
+		pthread_exit(NULL); // deallocate memory wherever the thread is
+	}
+
+
+	printf("EXIT signal: parent: Goodbye\n");
+	exit(1);
 }
+
+
