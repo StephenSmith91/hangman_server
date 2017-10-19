@@ -38,11 +38,12 @@ void EventLoop(int new_fd);
 
 
 /* Global Varaibles */
-bool keeprunning = true; // this flag gets set to false when ctl+c is pressed
+volatile sig_atomic_t keeprunning = 1; // this flag gets set to false when ctl+c is pressed
 int served_clients = -1;
 int sockfd;
-pthread_t pthr_id[NUM_HANDLER_THREADS];      /* thread IDs            */
-pthread_t parent_thread_id;
+pthread_t pthr_id[NUM_HANDLER_THREADS]; /* thread IDs  */   
+int thr_id[NUM_HANDLER_THREADS][2];  /* col 1: thread IDs. col 2: 1/0 (serving client)/(waiting for client) */     
+pthread_t parent_thread_id; /* parent thread ID  */
 
 /* global mutex for our program. assignment initializes it. */
 /* note that we use a RECURSIVE mutex, since a handler      */
@@ -85,12 +86,13 @@ struct Words{
 struct ThreadState{
 	int socket_id;
 	int current_player; // index to the clients place in the leader board
- }ThreadState;
+}ThreadState;
+
 
 /* format of a single request. */
 struct request {
     int number;             /* number of the request                  */
-    int socket_id;
+	int socket_id;
     struct request* next;   /* pointer to next request, NULL if none. */
 };
 
@@ -128,7 +130,7 @@ int SelectRandomNumber();
 char* concat(const char *s1, const char *s2);
 void signalhandler(int);
 
-void p(int new_fd, int games_played, int games_won);
+void ShowLeaderBoard(int new_fd, int games_played, struct ThreadState *thread_state_ptr);
 bool PlayGame(int new_fd);
 
 /* Funciton Implementations */
@@ -147,37 +149,37 @@ void add_request(int request_num, int socket, pthread_mutex_t* p_mutex, pthread_
     struct request* a_request;      /* pointer to newly added request.     */
 
     /* create structure with new request */
-    a_request = (struct request*)malloc(sizeof(struct request));
+	a_request = (struct request*)malloc(sizeof(struct request));
     if (!a_request) { /* malloc failed?? */
-        fprintf(stderr, "add_request: out of memory\n");
-        exit(1);
-    }
-    a_request->number = request_num;
-    a_request->socket_id = socket;
-    a_request->next = NULL;
+	fprintf(stderr, "add_request: out of memory\n");
+	exit(1);
+}
+a_request->number = request_num;
+a_request->socket_id = socket;
+a_request->next = NULL;
 
     /* lock the mutex, to assure exclusive access to the list */
-    rc = pthread_mutex_lock(p_mutex);
+rc = pthread_mutex_lock(p_mutex);
 
     /* add new request to the end of the list, updating list */
     /* pointers as required */
     if (num_requests == 0) { /* special case - list is empty */
-        requests = a_request;
-        last_request = a_request;
-    }
-    else {
-        last_request->next = a_request;
-        last_request = a_request;
-    }
+requests = a_request;
+last_request = a_request;
+}
+else {
+	last_request->next = a_request;
+	last_request = a_request;
+}
 
     /* increase total number of pending requests by one. */
-    num_requests++;
+num_requests++;
 
     /* unlock mutex */
-    rc = pthread_mutex_unlock(p_mutex);
+rc = pthread_mutex_unlock(p_mutex);
 
     /* signal the condition variable - there's a new request to handle */
-    rc = pthread_cond_signal(p_cond_var);
+rc = pthread_cond_signal(p_cond_var);
 }
 
 
@@ -197,26 +199,26 @@ struct request* get_request(pthread_mutex_t* p_mutex)
     struct request* a_request;      /* pointer to request.                 */
 
     /* lock the mutex, to assure exclusive access to the list */
-    rc = pthread_mutex_lock(p_mutex);
+	rc = pthread_mutex_lock(p_mutex);
 
-    if (num_requests > 0) {
-        a_request = requests;
-        requests = a_request->next;
+	if (num_requests > 0) {
+		a_request = requests;
+		requests = a_request->next;
         if (requests == NULL) { /* this was the last request on the list */
-            last_request = NULL;
-        }
+		last_request = NULL;
+	}
         /* decrease the total number of pending requests */
-        num_requests--;
-    }
+	num_requests--;
+}
     else { /* requests list is empty */
-        a_request = NULL;
-    }
+a_request = NULL;
+}
 
     /* unlock mutex */
-    rc = pthread_mutex_unlock(p_mutex);
+rc = pthread_mutex_unlock(p_mutex);
 
     /* return the request to the caller. */
-    return a_request;
+return a_request;
 }
 
 /*
@@ -228,12 +230,12 @@ struct request* get_request(pthread_mutex_t* p_mutex)
  */
 void handle_request(struct request* a_request, int thread_id)
 {
-    if (a_request) {
-        printf("Thread '%d' handled request '%d'\n",
-               thread_id, a_request->number);
-        fflush(stdout);
-        EventLoop(a_request->socket_id);
-    }
+	if (a_request) {
+		printf("Thread '%d' handled request '%d'\n",
+			thread_id, a_request->number);
+		fflush(stdout);
+		EventLoop(a_request->socket_id);
+	}
 }
 
 /*
@@ -253,19 +255,19 @@ void* handle_requests_loop(void* data)
 
 
     /* lock the mutex, to access the requests list exclusively. */
-    rc = pthread_mutex_lock(&request_mutex);
+	rc = pthread_mutex_lock(&request_mutex);
 
     /* do forever.... */
-    while (1) {
+	while (1) {
 
         if (num_requests > 0) { /* a request is pending */
-            a_request = get_request(&request_mutex);
+		a_request = get_request(&request_mutex);
             if (a_request) { /* got a request - handle it and free it */
                 /* unlock mutex - so other threads would be able to handle */
                 /* other reqeusts waiting in the queue paralelly.          */
-                rc = pthread_mutex_unlock(&request_mutex);
-                handle_request(a_request, thread_id);
-                free(a_request);
+		rc = pthread_mutex_unlock(&request_mutex);
+		handle_request(a_request, thread_id);
+                free(a_request);  							//need to be able to release this mem
                 /* and lock the mutex again. */
                 rc = pthread_mutex_lock(&request_mutex);
             }
@@ -275,7 +277,7 @@ void* handle_requests_loop(void* data)
             /* unlocked here, thus allowing other threads access to */
             /* requests list.                                       */
 
-            rc = pthread_cond_wait(&got_request, &request_mutex);
+        	rc = pthread_cond_wait(&got_request, &request_mutex);
             /* and after we return from pthread_cond_wait, the mutex  */
             /* is locked again, so we don't need to lock it ourselves */
 
@@ -296,13 +298,6 @@ void Instantiate_LeaderBoard(){
 		Leaderboard.gamesPlayed[ii] = 0;
 		Leaderboard.gamesWon[ii] = 0;
 	}
-// 		for(jj = 0; jj < sizeof(Leaderboard.clientNames[0])/sizeof(char); jj++){
-// 			Leaderboard.clientNames[ii][jj] = ' ';
-// 			if(jj == sizeof(Leaderboard.clientNames[0])/sizeof(char) - 1){
-// 				Leaderboard.clientNames[ii][jj] = '\0';
-// 			}	
-// 		}			
-// }
 }
 
 
@@ -430,52 +425,6 @@ void SetupSocket(int argc, char* argv[], int* portNumber, int* sockfd, struct so
 }
 
 
-
-/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ CheckForNewClient~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Provides interface for Listening, accetping, and authenticating new clients.
-May be used in a while loop in future use, to do this continually
-
-Inputs:
-		all socket information needed to do this
-*/
-void CheckForNewClient(int* sockfd, int* new_fd,\
-	struct sockaddr_in *my_addr, struct sockaddr_in *their_addr, socklen_t* sin_size){
-
-
-}
-
-
-/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Listen_Accept~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Server Listens and Accepts any connect() requests from other Clients
-
-Inputs:
-		int* sockfd : The server's socket file descriptor
-		int*new_fd  : The clients file descriptor
-
-Outputs:
-		Nothing
-// /**/
-// void Listen_Accept(int* sockfd, int* new_fd,\
-// 	struct sockaddr_in *my_addr, struct sockaddr_in *their_addr, socklen_t* sin_size){
-
-// 		/* start listnening */
-// 	if (listen(*sockfd, BACKLOG) == -1) {
-// 		perror("listen");
-// 		exit(1);
-// 	}
-
-// 	printf("server starts listnening ...\n");
-
-// 	if ((*new_fd = accept(*sockfd, (struct sockaddr *)their_addr, sin_size)) == -1) {
-// 		perror("accept");
-		
-// 	}
-// //printf("New fd  = %d\n", *new_fd);
-// //printf("server: got connection from %s\n", inet_ntoa((*my_addr).sin_addr));
-
-// }*/
-
-
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ AuthenticateClients~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Recieves username and password from client and checks that they match a pair from the authentication file
 Uses a for loop to find which client they are. Once found updates currentplayer to the client list number.
@@ -516,14 +465,18 @@ threadState_t*  AuthenticateClients(int* new_fd){
 			(strcmp(password, authentication.passwords[ii]) == 0)){
 			authentic = true;
 
-			thread_state_ptr = (threadState_t*)malloc(sizeof(ThreadState));
+		thread_state_ptr = (threadState_t*)malloc(sizeof(ThreadState));
 
-			(*thread_state_ptr).current_player = ii;
+			(*thread_state_ptr).current_player = ii; // get index of current player to leader board
+
+			thr_id[(*thread_state_ptr).current_player][1] = 1; // thread is serving a client
+
+			printf("Authenticate: Severfile:%s\n", authentication.usernames[(*thread_state_ptr).current_player]);
 
 			break;
 		}
 	}
-	printf("Authenticate: Severfile:%s\n", authentication.usernames[(*thread_state_ptr).current_player]);
+	
 
 	/* Send client the result */
 	if(authentic){
@@ -693,17 +646,17 @@ void ShowLeaderBoard(int new_fd, int games_played, struct ThreadState *thread_st
 
 		/* Send 0 to say no info at this time */
 		network_byte_order_short = htons(answer);
-		send(new_fd, &network_byte_order_short, sizeof(uint16_t), 0);
+	send(new_fd, &network_byte_order_short, sizeof(uint16_t), 0);
 
-		printf("Im at LeaderBoard - no games_played\n");
-		return;
-	}
+	printf("Im at LeaderBoard - no games_played\n");
+	return;
+}
 
 	/*Critical Readers section */
-	pthread_mutex_lock(&reader);
+pthread_mutex_lock(&reader);
 
-	read_count++;
-	if(read_count == 1){
+read_count++;
+if(read_count == 1){
 		sem_wait(&rw); // 1st reader blocks until something in leader board 
 	}
 	pthread_mutex_unlock(&reader);
@@ -731,16 +684,16 @@ void ShowLeaderBoard(int new_fd, int games_played, struct ThreadState *thread_st
 
 
 	//1. Go through leaderboard struct and keep indexes of players who have played a game
-		int player_index[NUMBER_CLIENTS]; int players_played = 0; int a;int t;
+	int player_index[NUMBER_CLIENTS]; int players_played = 0; int a;int t;
 
-		for(int ll = 0; ll < NUMBER_CLIENTS; ll++){
-			if (Leaderboard.gamesPlayed[ll] > 0){
-				player_index[players_played] = ll;
-				players_played++;
-				printf("Player indexes who have played: %d\n", ll);
-			}
+	for(int ll = 0; ll < NUMBER_CLIENTS; ll++){
+		if (Leaderboard.gamesPlayed[ll] > 0){
+			player_index[players_played] = ll;
+			players_played++;
+			printf("Player indexes who have played: %d\n", ll);
 		}
-		printf("Players who have played: %d\n", players_played);
+	}
+	printf("Players who have played: %d\n", players_played);
 
 	//order the player_index array so that it reflects game rules.
 	for (int k = 0; k < players_played-1; k++){
@@ -759,9 +712,9 @@ void ShowLeaderBoard(int new_fd, int games_played, struct ThreadState *thread_st
 
 				}else if(Leaderboard.gamesPlayed[player_index[k]] == Leaderboard.gamesPlayed[player_index[t]]){
 					if(Leaderboard.clientNames[player_index[k]][0] > Leaderboard.clientNames[player_index[t]][0]){
-					a = player_index[k];
-					player_index[k] = player_index[t];
-					player_index[t] = a;
+						a = player_index[k];
+						player_index[k] = player_index[t];
+						player_index[t] = a;
 
 					}
 				}
@@ -794,19 +747,19 @@ void ShowLeaderBoard(int new_fd, int games_played, struct ThreadState *thread_st
 	/*Send to Client thier name */
 	//memset(Name, '\0', sizeof(Name));
 	//strcpy(Name, Leaderboard.clientNames[(*thread_state_ptr).current_player]);
-	send(new_fd, Leaderboard.clientNames[player_index[k]], 11*sizeof(char), 0); 
+		send(new_fd, Leaderboard.clientNames[player_index[k]], 11*sizeof(char), 0); 
 	//printf("\nClient Name: %s\n", Leaderboard.clientNames[(*thread_state_ptr).current_player]);
 
 	/* Send to client thier number of games won */
-	toSend = Leaderboard.gamesWon[player_index[k]];
-	network_byte_order_short = htons(toSend);
-	send(new_fd, &network_byte_order_short, sizeof(uint16_t), 0);
+		toSend = Leaderboard.gamesWon[player_index[k]];
+		network_byte_order_short = htons(toSend);
+		send(new_fd, &network_byte_order_short, sizeof(uint16_t), 0);
 
 	/*Send to client their number of games played */
-	toSend = Leaderboard.gamesPlayed[player_index[k]] ;
-	network_byte_order_short = htons(toSend);
-	send(new_fd, &network_byte_order_short, sizeof(uint16_t), 0);
-}
+		toSend = Leaderboard.gamesPlayed[player_index[k]] ;
+		network_byte_order_short = htons(toSend);
+		send(new_fd, &network_byte_order_short, sizeof(uint16_t), 0);
+	}
 
 	/* end readers section */
 	pthread_mutex_lock(&reader);
@@ -917,6 +870,7 @@ bool PlayGame(int new_fd){
 		if ((numbytes=recv(new_fd, guess, sizeof(char), 0)) == -1) {
 			perror("recv: ");
 			exit(1);
+
 		}
 		//printf("guess recieved from client = %s\n", guess);
 		alreadyGuessed[i] = guess[0];//*concat(alreadyGuessed, guess);
@@ -1011,25 +965,26 @@ return won;
 */
 void EventLoop(int new_fd){
 	int choice = 0; 
-	int  keeprunning = 1; bool gameswon = false;
+	bool gameswon = false;
 	int games_played = 0;bool validInput = false;
 	threadState_t* thread_state_ptr;
 
 	if((thread_state_ptr = AuthenticateClients(&new_fd)) == NULL){
-		// deallocate memory and return;
+		//  no need to deallocate memory, return;
 		return;
 	}
 
-	printf("Event Loop: Client Name : %s\n", authentication.usernames[ThreadState.current_player]);
+	printf("Event Loop: Client Name : %s\n", authentication.usernames[(*thread_state_ptr).current_player]);
 
 	while(keeprunning){
-		while(!validInput || choice == 0){
+		while(!validInput || choice == 0 && keeprunning){
 			GetClientChoice(&choice, new_fd); /*Recieves Client choice */
 			validInput = CheckCorrectInput(choice, new_fd); /* Check response valid and send confirmation to Client */		
 		}
 		validInput = false;
 
 		if(choice == QUIT && keeprunning){ 
+			thr_id[(*thread_state_ptr).current_player][1] = 0; // thread is no longer serving client
 			free(thread_state_ptr);
 			close(new_fd);//other threads won't be able to do this - will need to be handled by main - but might not need to  id have a playing struct variable
 			return; // 
@@ -1055,9 +1010,11 @@ void EventLoop(int new_fd){
 			}		
 
 		} choice = 0; /* Reset choice */				
-	
-	if(!keeprunning){
-		free(thread_state_ptr);
+
+			if(!keeprunning){
+				printf("Im a working thread about to exit! \n");
+				free(thread_state_ptr);
+		close(new_fd);//other threads won't be able to do this - will need to be handled by main - but might not need to  id have a playing struct variable
 		pthread_exit(NULL); //exit thread
 	}
 }
@@ -1082,15 +1039,14 @@ int main(int argc, char* argv[]){
 
 
 	int i = 0;                                /* loop counter          */
-    
-    pthread_t  p_threads[NUM_HANDLER_THREADS];   /* thread's structures   */
+
+    //pthread_t  p_threads[NUM_HANDLER_THREADS];   /* thread's structures   */
     struct timespec delay;                       /* used for wasting time */
-	int thr_id[NUM_HANDLER_THREADS];      /* thread IDs            */
-    parent_thread_id = pthread_self();
-    int *client_list = malloc(sizeof(int));
+	parent_thread_id = pthread_self();
+	int *client_list = malloc(sizeof(int));
 
     /* semaphore intialisation: set vaule to 1 */
-    sem_init(&rw, 0, 1);
+	sem_init(&rw, 0, 1);
 
 
 
@@ -1109,35 +1065,37 @@ int main(int argc, char* argv[]){
 
 
     /* create the request-handling threads */
-    for (i=0; i<NUM_HANDLER_THREADS; i++) {
-        thr_id[i] = i;
-        pthr_id[i] = pthread_create(&p_threads[i], NULL, handle_requests_loop, (void*)&thr_id[i]);
-        printf("Thread ID: %d\n", (int)thr_id[i]);
+	for (i=0; i<NUM_HANDLER_THREADS; i++) {      
+        thr_id[i][1] = 0; //thread is not serving a client
+        thr_id[i][0] = i;
+        pthread_create(&(pthr_id[i]), NULL, handle_requests_loop, (void*)&thr_id[i][0]);
+
+        printf("Thread ID: %d\n", thr_id[i][0]);
     }
 
     while(1){ // this is the parent thread (thread #1) loop - keep adding 'jobs' to the list to do
 
 
-		if ((new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size)) == -1) {
-			perror("accept");
-		}
-		i++;
+    	if ((new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size)) == -1) {
+    		perror("accept");
+    	}
+    	i++;
 
-		client_list = (int*)realloc(client_list, sizeof(int) * i);
-		served_clients += 1;
+    	client_list = (int*)realloc(client_list, sizeof(int) * i);
+    	served_clients += 1;
 		client_list[served_clients] = new_fd; // store fd's and i, # fd's so can close the prgram with ctl+c
 
 		
 
 		add_request(served_clients, new_fd, &request_mutex, &got_request);
-		printf("______________Request number <%d> is added.\n", num_requests);
+		printf("Request number <%d> is added.\n", num_requests);
 
 		
 
 		printf("server: got connection from %s\n", \
-		inet_ntoa(their_addr.sin_addr));
+			inet_ntoa(their_addr.sin_addr));
 	 	/*char disp[30]; sprintf(disp, "\n%d", portNumber);puts(disp);*/ //checking local funcitons are actually assignining :/
-	
+
 	}
 
 	return 1;
@@ -1151,29 +1109,65 @@ int main(int argc, char* argv[]){
 Catches ct+c by user and exits program gracefully
 */
 void signalhandler(int signum){
-	
-	keeprunning = false; // get thread to return to pthred_create
 
-	// if main thread - wait until other threads exit
-	if(pthread_self() == parent_thread_id){
-		printf("\nEXIT signal: %d. Exiting as soon as possible\n", signum);
-		printf("EXIT signal: Closing Sockets\n");
 
-		//close(new_fd);
-		close(sockfd);
-		printf("EXIT signal: Waiting for other threads to exit...\n");	
+	switch(signum){
 
-		// wait for other threads to exit...
-		for(int ii = 0; ii < NUM_HANDLER_THREADS; ii++){ 
-			pthread_join(pthr_id[ii], NULL);
+		case SIGINT :
+
+
+			keeprunning = 0; // get thread to return to pthred_create
+
+			// if main thread - wait until other threads exit
+			if(pthread_self() == parent_thread_id){
+				printf("\nEXIT signal: %d. Exiting as soon as possible\n", signum);
+				printf("EXIT signal: Closing Sockets\n");
+
+				//close(new_fd);
+				close(sockfd);
+				printf("EXIT signal: Waiting for other threads to exit...\n");	
+
+				// // wait for other threads to exit...
+				// for(int ii = 0; ii < NUM_HANDLER_THREADS; ii++){ 
+				// 	pthread_kill(pthr_id[ii], 2);
+				// 	printf("%d Got a signal delivered to it\n", (int)pthr_id[ii]);
+				// }
+
+			// }else{ // non-parent threads quit straight away - or could just get them to quit when finished allocating
+				for(int jj = 0; jj < NUM_HANDLER_THREADS; jj++){
+					//if(pthread_equal(pthread_self(),pthr_id[jj]) != 0){
+
+					if(thr_id[jj][1] == 0){ // thread is not serving a client
+						printf("Not serving client =%d pno = %d\n", jj, (int)pthr_id[jj]);
+						pthread_kill(pthr_id[jj], 2); // deallocate memory wherever the thread is
+					}else{
+						printf("Im serving a client, wait for me: %d,   pno=%d\n", jj, (int)pthr_id[jj]);
+						//return;
+						pthread_exit(NULL);
+					}
+				}				
+				//}
+				
+			// for(int ii = 0; ii < NUM_HANDLER_THREADS; ii++){ 
+			// 	printf("Main exiting thread %d\n", ii);
+			// 	pthread_join(pthr_id[ii], NULL);
+
+			// }
+
+
+				printf("EXIT signal: parent: Goodbye\n");
+				exit(1);
+			}
+
+			case SIGPIPE :
+			//Ignore on write and return
+			break;
+
+			default :
+			// Another signal recieved
+			break;
 		}
-	}else{ // non-parent threads quit straight away - or could just get them to quit when finished allocating
-		pthread_exit(NULL); // deallocate memory wherever the thread is
-	}
 
-
-	printf("EXIT signal: parent: Goodbye\n");
-	exit(1);
 }
 
 
