@@ -1088,7 +1088,7 @@ int main(int argc, char* argv[]){
 		
 
 		add_request(served_clients, new_fd, &request_mutex, &got_request);
-		printf("______________Request number <%d> is added.\n", num_requests);
+		printf("Request number <%d> is added.\n", num_requests);
 
 		
 
