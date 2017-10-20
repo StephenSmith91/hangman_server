@@ -34,10 +34,9 @@
 #define NUM_HANDLER_THREADS 10/* number of threads used to service requests */
 
 
-void EventLoop(int new_fd);
-
-
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
 /* Global Varaibles */
+
 volatile sig_atomic_t keeprunning = 1; // this flag gets set to false when ctl+c is pressed
 int served_clients = -1;
 int sockfd;
@@ -65,7 +64,7 @@ pthread_mutex_t reader = PTHREAD_MUTEX_INITIALIZER;
 int read_count = 0;
 
 
-
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
 /* Structs */
 
 /* Authentication struct - stores passwords and usernames */
@@ -115,7 +114,14 @@ int sockfd;
 };
 
 
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
 /* Function Prototypes */
+
+void add_request(int request_num, int socket, pthread_mutex_t* p_mutex, pthread_cond_t*  p_cond_var);
+struct request* get_request(pthread_mutex_t* p_mutex);
+void handle_request(struct request* a_request, int thread_id);
+void* handle_requests_loop(void* data);
+
 void Instantiate_LeaderBoard();
 
 void LoadFiles();
@@ -142,9 +148,11 @@ void signalhandler(int signum, siginfo_t *si, void* unused);
 void* handle_client_requests(void* noinfo);
 void ShowLeaderBoard(int new_fd, int games_played, struct ThreadState *thread_state_ptr);
 bool PlayGame(int new_fd);
+void EventLoop(int new_fd);
 
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
 /* Funciton Implementations */
-
 
 /*
 * function add_request(): add a request to the requests list
@@ -203,8 +211,7 @@ rc = pthread_cond_signal(p_cond_var);
 * output:    pointer to the removed request, or NULL if none.
 * memory:    the returned request need to be freed by the caller.
 */
-struct request* get_request(pthread_mutex_t* p_mutex)
-{
+struct request* get_request(pthread_mutex_t* p_mutex){
 int rc;                         /* return code of pthreads functions.  */
 struct request* a_request;      /* pointer to request.                 */
 
@@ -238,8 +245,7 @@ return a_request;
 * input:     request pointer, id of calling thread.
 * output:    none.
 */
-void handle_request(struct request* a_request, int thread_id)
-{
+void handle_request(struct request* a_request, int thread_id){
 if (a_request) {
 	printf("Thread '%d' handled request '%d'\n",
 		thread_id, a_request->number);
@@ -257,8 +263,7 @@ if (a_request) {
 * input:     id of thread, for printing purposes.
 * output:    none.
 */
-void* handle_requests_loop(void* data)
-{
+void* handle_requests_loop(void* data){
 int rc;                         /* return code of pthreads functions.  */
 struct request* a_request;      /* pointer to a request.               */
 int thread_id = *((int*)data);  /* thread identifying number           */
@@ -297,10 +302,18 @@ while (1) {
 }
 
 
+/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ LoadFiles~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Interface for loading textfiles functions
+*/
+void LoadFiles(){
+Instantiate_LeaderBoard();
+LoadCredentils();
+LoadWords();	
+}
 
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Instantiate_ThreadState ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Instantiate struct members of cleintStates to 0
+Instantiate struct members of Leader Borad to 0
 */
 void Instantiate_LeaderBoard(){
 int jj =0;
@@ -311,15 +324,6 @@ for(int ii = 0; ii < NUMBER_CLIENTS; ii++){
 }
 }
 
-
-/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ LoadFiles~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Interface for loading textfiles functions
-*/
-void LoadFiles(){
-Instantiate_LeaderBoard();
-LoadCredentils();
-LoadWords();	
-}
 
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ LoadCredentials~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -336,14 +340,6 @@ char* chuckaway1 = (char*)malloc(20*sizeof(char));
 char* chuckaway2 = (char*)malloc(20*sizeof(char));
 int our_number;
 
-/* TODO: Allocate memory using Malloc instead */
-
-/* Allocate Space for usernames and passwords */ 
-
-// if((char *)malloc(CHAR_SIZE*sizeof(char)) == NULL){
-// 	printf("Malloc \n");
-// 	exit(1);
-// }
 
 /* "r" == read from existing file */
 if((fp = fopen(filename, "r")) == NULL){
@@ -443,7 +439,6 @@ Send 1 for authentic, 0 for non-authentic, back to the client
 In event is not authentic, close new_fd, server socket and then exit
 
 Inputs:
-	int* sockfd : The server's socket file descriptor
 	int*new_fd  : The clients file descriptor
 
 Outputs:
@@ -586,6 +581,13 @@ send(new_fd, &network_byte_order_short, sizeof(uint16_t), 0);
 
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ SelectRandomNumber ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Selects and returns a random number between 0 - NUMBER_OF_WORDS
+
+Inputs:
+	nothing.
+
+Outputs:
+	int random_number : a random value
 */
 int SelectRandomNumber(){
 int random_number;
@@ -598,6 +600,13 @@ return random_number;
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ concat ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Puts to strings together, and puts a null terminating charcater at the end, eg '/0'
+
+Inputs:
+	const char *s1 : first string to concatenate. Will be put at beginning of string
+	const char *s2 : second sting to concatenate
+
+Outputs:
+	char *result   : the first and second string, cocatenated, with a '\0' appendding 
 */
 char* concat(const char *s1, const char *s2){
 int jj = 0;
@@ -620,7 +629,18 @@ return result;
 
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ FindWordLength ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Finds the words specified by the random index and returns their combined length
+Finds the words specified by the random index and updates the values stored in the 
+wordlength variable. 
+
+Inputs:
+	int randomIndex : random integer index
+	int* wordLength : address of integer containing the value of wordlength
+
+Outputs:
+	nothing, but 
+	wordLength[0] contains the length of the first word
+	wordLength[1] contains the length of the second word
+	wordLength[2] contains the length of the first word + second word
 */
 void FindWordLength(int randomIndex, int* wordLength){
 char letters[20];
@@ -634,6 +654,12 @@ wordLength[2] = wordLength[0] + wordLength[1];
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ CalcGuessLeft ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Calculates number of guess
+
+Inputs:
+	int wordLength : actually wordLength[2], combined length of two random words
+
+Ouputs:
+	int guess_left : number of guess left the client has in the game
 */
 int CalcGuessLeft(int wordLength){
 int guess_left;
@@ -647,7 +673,51 @@ return guess_left;
 }
 
 
+/* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ handle_client_requests ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Handles client requests to connect to the server
+*/
+void* handle_client_requests(void* noinfo){
+int new_fd, i = 0;
+struct sockaddr_in their_addr; /* connector's address information */
+socklen_t sin_size = sizeof(struct sockaddr_in);
+int client_list[NUM_HANDLER_THREADS];
+
+// Listen_Accept for clients
+if (listen(sockfd, BACKLOG) == -1) {
+	perror("listen");
+	exit(1);
+}
+printf("server starts listnening ...\n");
+
+/* Accept new client socket connect() attempts */
+while(1){ 
+	while(served_clients < NUMBER_CLIENTS){ // only accept new connections in < NUMBER_THREAADS
+
+		if ((new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size)) == -1) {    		
+			perror("accept");
+		}
+		i++;
+
+		served_clients++;		
+		client_list[served_clients] = new_fd; // store fd's and i, # fd's so can close the prgram with ctl+c		
+
+		add_request(served_clients, new_fd, &request_mutex, &got_request);
+		printf("Request number <%d> is added.\n", num_requests);		
+	}    	
+}
+}
+
+
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ShowLeaderBoard ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Sends Leaderboard data to client if they have played a game
+
+Inputs:
+	int new_fd : 							: socket file discriptor associated with the client
+	struct ThreadState *thread_state_ptr	: data for the thread, contains pointer to Leader board struct
+	int games_played						: games played - local variable to thread
+
+Ouputs:
+	nothing
 */
 void ShowLeaderBoard(int new_fd, int games_played, struct ThreadState *thread_state_ptr){
 int answer = 0, result = 0;
@@ -1104,36 +1174,6 @@ return 1;
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 /* Interrupts */
 
-void* handle_client_requests(void* noinfo){
-int new_fd, i = 0;
-struct sockaddr_in their_addr; /* connector's address information */
-socklen_t sin_size = sizeof(struct sockaddr_in);
-int client_list[NUM_HANDLER_THREADS];
-
-// Listen_Accept for clients
-if (listen(sockfd, BACKLOG) == -1) {
-	perror("listen");
-	exit(1);
-}
-printf("server starts listnening ...\n");
-
-/* Accept new client socket connect() attempts */
-while(1){ 
-	while(served_clients < NUMBER_CLIENTS){ // only accept new connections in < NUMBER_THREAADS
-
-		if ((new_fd = accept(sockfd, (struct sockaddr *)&their_addr, &sin_size)) == -1) {    		
-			perror("accept");
-		}
-		i++;
-
-		served_clients++;		
-		client_list[served_clients] = new_fd; // store fd's and i, # fd's so can close the prgram with ctl+c		
-
-		add_request(served_clients, new_fd, &request_mutex, &got_request);
-		printf("Request number <%d> is added.\n", num_requests);		
-	}    	
-}
-}
 
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ signalhandler ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
